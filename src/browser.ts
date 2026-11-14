@@ -1,1043 +1,222 @@
-import {
-  chromium,
-  Browser,
-  Page,
-  BrowserContext,
-  Frame,
-  FrameLocator,
-} from "playwright";
-import { promptVerificationCode } from "./input.js";
-import path from "path";
-import { existsSync } from "fs";
-import { VerificationCodeProvider } from "./types.js";
+import { type Browser, type Frame, type Locator, type Page } from 'playwright';
+import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { promptVerificationCode } from './input.js';
+import type { BrowserResult, VerificationCodeProvider } from './types.js';
+import { ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS, OperationError, VERIFICATION_TIMEOUT_MS, abortable, within, asOperationError, withBrowser, type BrowserOptions } from './runtime.js';
+import { saveDiagnostics } from './diagnostics.js';
+import { assertNoAccessBlock, cleanupExpiredTokens, findToken, tokenDescription, waitForTokenList } from './token-list.js';
 
-const APPLE_DEVELOPER_URL =
-  "https://developer.apple.com/account/resources/services/maps-tokens";
+const APPLE_DEVELOPER_URL = 'https://developer.apple.com/account/resources/services/maps-tokens';
+export const AUTH_STATE_FILE = path.join(process.env.DATA_DIR || process.cwd(), '.auth-state.json');
+export function getTargetUrl(): string { return APPLE_DEVELOPER_URL; }
 
-// 登录状态存储文件路径
-// 支持通过 DATA_DIR 环境变量配置数据目录（用于 Docker 环境）
-const DATA_DIR = process.env.DATA_DIR || process.cwd();
-export const AUTH_STATE_FILE = path.join(DATA_DIR, ".auth-state.json");
-
-/**
- * 打开浏览器并跳转到苹果开发者后台
- */
-export async function openAppleDeveloperPortal(
-  headless: boolean = false
-): Promise<void> {
-  console.log("🚀 正在启动浏览器...");
-
-  const browser = await chromium.launch({
-    headless,
-    args: ["--window-size=1280,800"],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    locale: "zh-CN",
-  });
-
-  const page = await context.newPage();
-
-  console.log(`📍 正在跳转到: ${APPLE_DEVELOPER_URL}`);
-  await page.goto(APPLE_DEVELOPER_URL, { waitUntil: "domcontentloaded" });
-
-  console.log("✅ 浏览器已打开，页面已加载");
-  console.log("💡 提示: 按 Ctrl+C 关闭程序和浏览器");
-
-  const cleanup = async () => {
-    console.log("\n🔒 正在关闭浏览器...");
-    await browser.close();
-    process.exit(0);
-  };
-
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
-
-  await new Promise(() => {});
-}
-
-/**
- * 获取目标 URL
- */
-export function getTargetUrl(): string {
-  return APPLE_DEVELOPER_URL;
-}
-
-/**
- * 登录并获取现有 MapKit Token
- */
-export async function getMapKitToken(
-  username: string,
-  password: string,
-  headless: boolean = false,
-  useAuthCache: boolean = true
-): Promise<string | null> {
-  console.log("🚀 正在启动浏览器...");
-
-  // 检查是否存在登录状态文件
-  const hasAuthState = existsSync(AUTH_STATE_FILE) && useAuthCache;
-
-  const browser = await chromium.launch({
-    headless,
-    args: ["--window-size=1280,800"],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    locale: "zh-CN",
-    ...(hasAuthState ? { storageState: AUTH_STATE_FILE } : {}),
-  });
-
-  if (hasAuthState) {
-    console.log("🔄 已加载缓存的登录状态");
-  }
-
-  const page = await context.newPage();
-
-  try {
-    // 跳转到目标页面
-    console.log(`📍 正在跳转到: ${APPLE_DEVELOPER_URL}`);
-    await page.goto(APPLE_DEVELOPER_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
-    });
-    await page.waitForTimeout(3000);
-
-    const currentUrl = page.url();
-    console.log(`📍 当前页面: ${currentUrl}`);
-
-    // 检测是否需要登录
-    if (isLoginPage(currentUrl)) {
-      console.log("🔐 检测到登录页面，正在登录...");
-
-      const loginSuccess = await performLogin(page, username, password);
-      if (!loginSuccess) {
-        console.error("❌ 登录失败");
-        await browser.close();
-        return null;
-      }
-
-      console.log("✅ 登录成功");
-
-      // 保存登录状态
-      console.log("💾 保存登录状态...");
-      await context.storageState({ path: AUTH_STATE_FILE });
-      console.log("✅ 登录状态已保存");
-
-      await page.waitForTimeout(3000);
-    }
-
-    // 确保在 Token 页面
-    const afterLoginUrl = page.url();
-    if (!afterLoginUrl.includes("maps-tokens")) {
-      console.log("📍 正在跳转到 Token 管理页面...");
-      await page.goto(APPLE_DEVELOPER_URL, {
-        waitUntil: "networkidle",
-        timeout: 60000,
-      });
-    }
-
-    // 提取 Token
-    console.log("⏳ 等待页面加载...");
-    await page.waitForTimeout(5000);
-
-    console.log("🔍 正在获取最新 Token...");
-    const token = await getLatestTokenFromList(page);
-
-    if (token) {
-      console.log("\n═══════════════════════════════════════");
-      console.log("✅ Token 获取成功！");
-      console.log("═══════════════════════════════════════\n");
-      console.log(token);
-      console.log("");
-
-      // 清理过期的 Token
-      await cleanupExpiredTokens(page);
-    } else {
-      console.log("\n⚠️  未能自动提取 Token");
-      console.log("💡 请在浏览器中手动操作，完成后按 Ctrl+C 退出");
-
-      await new Promise((resolve) => {
-        process.on("SIGINT", async () => {
-          await browser.close();
-          resolve(null);
-        });
-      });
-    }
-
-    // 保存最新的登录状态
-    console.log("💾 保存登录状态...");
-    await context.storageState({ path: AUTH_STATE_FILE });
-
-    await browser.close();
-    return token;
-  } catch (error) {
-    console.error(
-      "❌ 发生错误:",
-      error instanceof Error ? error.message : error
-    );
-    await browser.close();
-    return null;
-  }
-}
-
-// ========== 辅助函数 ==========
-
-/**
- * 判断是否为登录页面
- */
 function isLoginPage(url: string): boolean {
-  return url.includes("idmsa.apple.com") || url.includes("appleid.apple.com");
+  try { return ['idmsa.apple.com', 'appleid.apple.com', 'account.apple.com'].includes(new URL(url).hostname); }
+  catch { return false; }
 }
 
-/**
- * 执行登录流程
- */
-async function performLogin(
-  page: Page,
-  username: string,
-  password: string,
-  verificationCodeProvider?: VerificationCodeProvider
-): Promise<boolean> {
-  try {
-    console.log("⏳ 等待登录表单加载...");
-    await page
-      .waitForLoadState("networkidle", { timeout: 30000 })
-      .catch(() => {});
-    await page.waitForTimeout(3000);
-
-    // 查找登录表单所在的 frame
-    const loginFrame = await findLoginFrame(page);
-    if (!loginFrame) {
-      console.error("❌ 未找到登录表单");
-      return false;
-    }
-    console.log("✅ 找到登录表单");
-
-    // 输入账号
-    console.log("📝 输入账号...");
-    await loginFrame.locator("#account_name_text_field").fill(username);
-    await page.waitForTimeout(1000);
-
-    // 点击继续
-    console.log("🔘 点击继续...");
-    const signInBtn = loginFrame.locator("#sign-in");
-    if (await signInBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await signInBtn.click();
-    } else {
-      await loginFrame.locator("#account_name_text_field").press("Enter");
-    }
-
-    // 等待密码输入框
-    console.log("⏳ 等待密码输入框...");
-    await page.waitForTimeout(3000);
-
-    const passwordFrame = await findLoginFrame(page);
-    if (!passwordFrame) {
-      console.error("❌ 页面变化后未找到登录表单");
-      return false;
-    }
-
-    try {
-      await passwordFrame
-        .locator("#password_text_field")
-        .waitFor({ state: "visible", timeout: 30000 });
-    } catch {
-      console.error("❌ 未找到密码输入框");
-      return false;
-    }
-
-    // 输入密码
-    console.log("📝 输入密码...");
-    await passwordFrame.locator("#password_text_field").fill(password);
-    await page.waitForTimeout(1000);
-
-    // 勾选"记住我的账户"
-    console.log('☑️  勾选"记住我的账户"...');
-    try {
-      // 点击 label 而不是 checkbox，因为 checkbox 被样式元素遮挡
-      const rememberMeLabel = passwordFrame.locator("#remember-me-label");
-      if (
-        await rememberMeLabel.isVisible({ timeout: 2000 }).catch(() => false)
-      ) {
-        const checkbox = passwordFrame.locator("#remember-me");
-        const isChecked = await checkbox.isChecked().catch(() => false);
-        if (!isChecked) {
-          await rememberMeLabel.click({ timeout: 5000 });
-        }
-      }
-    } catch (e) {
-      // 勾选失败不影响登录流程，继续执行
-      console.log('⚠️  未能勾选"记住我的账户"，继续登录...');
-    }
-    await page.waitForTimeout(500);
-
-    // 点击登录
-    console.log("🔘 点击登录...");
-    const loginBtn = passwordFrame.locator("#sign-in");
-    if (await loginBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await loginBtn.click();
-    } else {
-      await passwordFrame.locator("#password_text_field").press("Enter");
-    }
-
-    // 等待登录处理
-    console.log("⏳ 等待登录处理...");
-    await page.waitForTimeout(5000);
-
-    // 检测并处理两步验证
-    if (await check2FAPage(page)) {
-      console.log("📱 检测到两步验证...");
-      if (!(await handle2FA(page, verificationCodeProvider))) {
-        return false;
-      }
-    }
-
-    // 处理"信任此浏览器"页面
-    await handleTrustBrowser(page);
-
-    // 等待到达目标页面
-    console.log("⏳ 等待页面跳转...");
-    const targetReached = await waitForTargetPage(page, 30000);
-
-    if (targetReached) {
-      return true;
-    }
-
-    // 检查登录状态
-    const currentUrl = page.url();
-    if (isLoginPage(currentUrl)) {
-      const errorMsg = await getErrorMessage(page);
-      if (errorMsg) {
-        console.error(`❌ 登录错误: ${errorMsg}`);
-        return false;
-      }
-
-      // 再次尝试两步验证和信任浏览器
-      if (await check2FAPage(page)) {
-        if (!(await handle2FA(page, verificationCodeProvider))) return false;
-        await handleTrustBrowser(page);
-        return await waitForTargetPage(page, 15000);
-      }
-
-      await handleTrustBrowser(page);
-      return await waitForTargetPage(page, 10000);
-    }
-
-    return true;
-  } catch (error) {
-    console.error(
-      "❌ 登录过程出错:",
-      error instanceof Error ? error.message : error
-    );
-    return false;
-  }
+async function clickOrEnter(button: Locator, input: Locator): Promise<void> {
+  if (await button.isVisible().catch(() => false)) await button.click();
+  else await input.press('Enter');
 }
 
-/**
- * 获取错误消息
- */
-async function getErrorMessage(page: Page): Promise<string | null> {
-  const frame = await findLoginFrame(page);
-  if (!frame) return null;
-
-  const errorMsg = frame
-    .locator('.form-message-wrapper, .error, [role="alert"]')
-    .first();
-  if (await errorMsg.isVisible({ timeout: 1000 }).catch(() => false)) {
-    const text = await errorMsg.textContent();
-    return text?.trim() || null;
-  }
-  return null;
-}
-
-/**
- * 处理"信任此浏览器"页面
- */
-async function handleTrustBrowser(page: Page): Promise<void> {
-  try {
-    await page.waitForTimeout(2000);
-
-    const trustSelectors = [
-      'button:has-text("信任")',
-      'button:has-text("Trust")',
-      'button.button-rounded-rectangle:has-text("信任")',
-    ];
-
-    for (const selector of trustSelectors) {
-      const btn = page.locator(selector).first();
-      if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
-        console.log('🔘 点击"信任"按钮...');
-        await btn.click();
-        await page.waitForTimeout(2000);
-        return;
-      }
-    }
-
-    // 检查 iframe
+/** One deadline shared by all frames, including frames attached after the first scan. */
+export async function findLoginFrame(page: Page, selector = '#account_name_text_field', timeout = ACTION_TIMEOUT_MS): Promise<Frame> {
+  const deadline = Date.now() + timeout;
+  do {
     for (const frame of page.frames()) {
-      if (frame === page.mainFrame()) continue;
-      for (const selector of trustSelectors) {
-        try {
-          const btn = frame.locator(selector).first();
-          if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
-            console.log('🔘 在 iframe 中点击"信任"按钮...');
-            await btn.click();
-            await page.waitForTimeout(2000);
-            return;
-          }
-        } catch {
-          continue;
-        }
-      }
+      if (await frame.locator(selector).first().isVisible().catch(() => false)) return frame;
     }
-  } catch {
-    /* 没有信任按钮 */
-  }
+    await assertNoAccessBlock(page);
+    await page.waitForTimeout(Math.min(200, Math.max(1, deadline - Date.now())));
+  } while (Date.now() < deadline);
+  throw new OperationError('ELEMENT_TIMEOUT', '等待登录输入框超时');
 }
 
-/**
- * 等待到达目标页面
- */
-async function waitForTargetPage(
-  page: Page,
-  timeout: number
-): Promise<boolean> {
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeout) {
-    const currentUrl = page.url();
-
-    if (currentUrl.startsWith("https://developer.apple.com/")) {
-      console.log("✅ 已到达开发者后台");
-      return true;
-    }
-
-    await handleTrustBrowser(page);
-    await page.waitForTimeout(1000);
-  }
-
-  return false;
-}
-
-/**
- * 查找登录表单所在的 frame
- */
-async function findLoginFrame(
-  page: Page
-): Promise<Page | Frame | FrameLocator | null> {
-  // 检查主框架
-  const mainInput = page.locator("#account_name_text_field");
-  if (await mainInput.isVisible({ timeout: 2000 }).catch(() => false)) {
-    return page;
-  }
-
-  // 检查 iframe
+async function trustBrowser(page: Page): Promise<void> {
   for (const frame of page.frames()) {
-    if (frame === page.mainFrame()) continue;
-    try {
-      const input = frame.locator("#account_name_text_field");
-      if (await input.isVisible({ timeout: 1000 }).catch(() => false)) {
-        console.log("📍 登录表单在 iframe 中");
-        return frame;
-      }
-    } catch {
-      continue;
-    }
+    const trust = frame.getByRole('button', { name: /^(Trust|信任)$/i }).first();
+    if (await trust.isVisible().catch(() => false)) { await trust.click(); return; }
   }
-
-  return null;
 }
 
-/**
- * 检测是否为两步验证页面
- */
-async function check2FAPage(page: Page): Promise<boolean> {
-  const selectors = [
-    ".form-security-code-input",
-    "#security-code",
-    'input[name="security-code"]',
-  ];
-
-  for (const selector of selectors) {
-    const el = page.locator(selector).first();
-    if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-      return true;
-    }
-  }
-
-  // 检查 iframe
-  for (const frame of page.frames()) {
-    if (frame === page.mainFrame()) continue;
-    try {
-      const el = frame.locator(".form-security-code-input").first();
-      if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
-        return true;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return false;
+function verificationInput(frame: Frame): Locator {
+  return frame.locator('.form-security-code-input, #security-code, input[name="security-code"]').first();
 }
 
-/**
- * 处理两步验证
- * @param page Playwright Page 对象
- * @param verificationCodeProvider 可选的验证码提供者函数（Server 模式使用）
- */
-async function handle2FA(
-  page: Page,
-  verificationCodeProvider?: VerificationCodeProvider
-): Promise<boolean> {
+async function verify(page: Page, frame: Frame, signal: AbortSignal, provider?: VerificationCodeProvider): Promise<void> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(signal.reason);
+  signal.addEventListener('abort', cancel, { once: true });
+  if (signal.aborted) cancel();
+  const timer = setTimeout(() => controller.abort(new OperationError('VERIFICATION_TIMEOUT', '验证码输入超时')), VERIFICATION_TIMEOUT_MS);
   try {
-    // 根据模式选择验证码获取方式
-    let code: string | null;
-    if (verificationCodeProvider) {
-      console.log("📱 等待远程验证码输入...");
-      code = await verificationCodeProvider();
-    } else {
-      code = await promptVerificationCode();
-    }
+    const code = await abortable(provider ? provider() : promptVerificationCode(controller.signal), controller.signal);
+    signal.throwIfAborted();
+    if (!code || !/^\d{6}$/.test(code)) throw new OperationError('VERIFICATION_FAILED', '未收到有效验证码');
+    const inputs = frame.locator('.form-security-code-input');
+    const count = await inputs.count();
+    if (count === 6) {
+      for (let index = 0; index < count; index++) await inputs.nth(index).fill(code[index]);
+    } else await verificationInput(frame).fill(code);
+    const submit = frame.getByRole('button', { name: /^(Continue|Verify|继续|验证)$/i }).first();
+    if (await submit.isVisible().catch(() => false)) await submit.click();
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', cancel);
+  }
+}
 
-    if (!code) {
-      console.error("❌ 未收到验证码（可能已超时或取消）");
-      return false;
-    }
-
-    if (!code || code.length !== 6) {
-      console.error("❌ 请输入6位验证码");
-      return false;
-    }
-
-    console.log("📝 输入验证码...");
-
-    // 查找验证码输入框所在的 frame
-    let codeFrame: Page | Frame | null = null;
-
-    if ((await page.locator(".form-security-code-input").count()) > 0) {
-      codeFrame = page;
-    } else {
-      for (const frame of page.frames()) {
-        if (frame === page.mainFrame()) continue;
-        try {
-          if ((await frame.locator(".form-security-code-input").count()) > 0) {
-            codeFrame = frame;
-            break;
-          }
-        } catch {
-          continue;
-        }
+export async function performLogin(page: Page, username: string, password: string, signal: AbortSignal, provider?: VerificationCodeProvider): Promise<void> {
+  const accountFrame = await findLoginFrame(page);
+  const account = accountFrame.locator('#account_name_text_field');
+  await account.fill(username);
+  await clickOrEnter(accountFrame.locator('#sign-in'), account);
+  const passwordFrame = await findLoginFrame(page, '#password_text_field');
+  const passwordInput = passwordFrame.locator('#password_text_field');
+  await passwordInput.fill(password);
+  const remember = passwordFrame.locator('#remember-me-label');
+  if (await remember.isVisible().catch(() => false)) {
+    const checked = await passwordFrame.locator('#remember-me').isChecked().catch(() => true);
+    if (!checked) await remember.click({ timeout: 3_000 }).catch(() => {});
+  }
+  await clickOrEnter(passwordFrame.locator('#sign-in'), passwordInput);
+  let verified = false;
+  let deadline = Date.now() + 60_000;
+  do {
+    signal.throwIfAborted();
+    await assertNoAccessBlock(page);
+    if (page.url().startsWith('https://developer.apple.com/')) return;
+    for (const frame of page.frames()) {
+      const error = frame.locator('.form-message-wrapper, .error, [role="alert"]').first();
+      if (await error.isVisible().catch(() => false) && (await error.innerText()).trim()) {
+        // Do not include arbitrary page text that might contain credentials.
+        throw new OperationError('LOGIN_FAILED', 'Apple 登录失败，请检查账号状态');
+      }
+      if (!verified && await verificationInput(frame).isVisible().catch(() => false)) {
+        await verify(page, frame, signal, provider);
+        verified = true;
+        deadline = Date.now() + 60_000;
       }
     }
+    await trustBrowser(page);
+    await page.waitForTimeout(200);
+  } while (Date.now() < deadline);
+  throw new OperationError('LOGIN_FAILED', '登录后未能进入 Apple Developer 后台');
+}
 
-    if (!codeFrame) {
-      console.error("❌ 未找到验证码输入框");
-      return false;
+async function createNewToken(page: Page): Promise<string> {
+  const description = tokenDescription();
+  // Prefer the actual accessible control, keep the known SVG as a compatibility fallback.
+  const semantic = page.getByRole('button', { name: /^(Add(?: Token)?|Create Token|添加(?:令牌|Token)?|新增(?:令牌|Token)?)$/i });
+  const add = semantic.or(page.locator('svg[color="#0070c9"]')).first();
+  await add.waitFor({ state: 'visible' });
+  await add.click();
+  await page.locator('input[name="tokenType"][value="serverAPI"]').check();
+  await page.locator('input[name="tokenEnvironment"][value="test"]').check();
+  const descriptionInput = page.getByRole('textbox', { name: /description|描述/i })
+    .or(page.locator('input[placeholder*="Description"]')).first();
+  await descriptionInput.fill(description);
+  const create = page.getByRole('button', { name: /^(Create|创建)$/i });
+  await create.click();
+  await create.waitFor({ state: 'hidden' });
+  // Apple may reset the successful creation wizard back to its first step.
+  const dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: /^(Create Maps Token|创建地图令牌)$/i }) }).first();
+  if (await dialog.isVisible().catch(() => false)) {
+    const next = dialog.getByRole('button', { name: /^(Next|下一步)$/i });
+    if (await next.isVisible().catch(() => false)) {
+      await dialog.getByRole('button', { name: /^(Cancel|取消|Close|关闭)$/i }).click();
+      await dialog.waitFor({ state: 'hidden' });
     }
-
-    // 输入6位验证码
-    const digitInputs = codeFrame.locator(".form-security-code-input");
-    const count = await digitInputs.count();
-    console.log(`📝 找到 ${count} 个验证码输入框`);
-
-    const digits = code.split("");
-    for (let i = 0; i < Math.min(count, digits.length); i++) {
-      await digitInputs.nth(i).fill(digits[i]);
-      await page.waitForTimeout(100);
-    }
-
-    console.log("⏳ 等待验证...");
-    await page.waitForTimeout(3000);
-
-    // 尝试点击继续按钮
-    const submitSelectors = [
-      'button:has-text("继续")',
-      'button:has-text("验证")',
-      'button:has-text("Trust")',
-      'button:has-text("Continue")',
-    ];
-
-    for (const selector of submitSelectors) {
-      const btn = page.locator(selector).first();
-      if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
-        console.log("🔘 点击继续...");
-        await btn.click();
-        break;
-      }
-    }
-
-    await page.waitForTimeout(5000);
-    console.log("✅ 验证码已提交");
-    return true;
-  } catch (error) {
-    console.error(
-      "❌ 两步验证处理出错:",
-      error instanceof Error ? error.message : error
-    );
-    return false;
   }
+  await waitForTokenList(page);
+  // Creation may update the table after the modal has closed.
+  const deadline = Date.now() + ACTION_TIMEOUT_MS;
+  do {
+    await assertNoAccessBlock(page);
+    try { return await findToken(page, description); }
+    catch (error) {
+      if (!(error instanceof OperationError) || !['TOKEN_NOT_FOUND', 'TOKEN_LIST_UNRECOGNIZED'].includes(error.code)) throw error;
+    }
+    await page.waitForTimeout(200);
+  } while (Date.now() < deadline);
+  throw new OperationError('TOKEN_NOT_FOUND', '创建后未能读取本次生成的 Token');
 }
 
-/**
- * 解析日期字符串（格式：MM/DD/YY）
- */
-function parseExpirationDate(dateStr: string): Date | null {
-  try {
-    const parts = dateStr.trim().split("/");
-    if (parts.length !== 3) return null;
-
-    const month = parseInt(parts[0], 10) - 1; // 月份从0开始
-    const day = parseInt(parts[1], 10);
-    let year = parseInt(parts[2], 10);
-
-    // 处理两位数年份，假设 00-99 对应 2000-2099
-    if (year < 100) {
-      year += 2000;
-    }
-
-    return new Date(year, month, day);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 清理过期的 Token
- * 扫描 token 列表，找出所有过期的 token，逐个执行 Revoke 操作删除
- */
-async function cleanupExpiredTokens(page: Page): Promise<void> {
-  console.log("\n🧹 开始清理过期的 Token...");
-
-  try {
-    // 等待页面稳定
-    await page.waitForTimeout(2000);
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0); // 只比较日期部分
-
-    let cleanedCount = 0;
-    let failedCount = 0;
-
-    // 循环清理，因为每次删除后 DOM 会变化
-    while (true) {
-      // 获取所有 token 行
-      const rows = page
-        .locator('table tbody tr, .token-row, [class*="row"]')
-        .filter({
-          has: page.locator('[class*="action-remove"], .action-remove'),
-        });
-
-      // 如果没有更通用的选择器，尝试获取表格行
-      const tableRows = page.locator("table tbody tr");
-      const rowCount = await tableRows.count().catch(() => 0);
-
-      if (rowCount === 0) {
-        // 尝试其他可能的行结构
-        console.log("📋 未找到标准表格结构，尝试其他方式...");
-        break;
-      }
-
-      let foundExpired = false;
-
-      // 遍历每一行，查找过期的 Token
-      for (let i = 0; i < rowCount; i++) {
-        const row = tableRows.nth(i);
-
-        // 获取所有单元格
-        const cells = row.locator("td");
-        const cellCount = await cells.count();
-
-        // 根据截图，EXPIRATION 列是第5列（索引4）
-        // 表格结构：DOMAINS | DESCRIPTION | TOKEN | CREATION | EXPIRATION | ACTION
-        if (cellCount < 5) continue;
-
-        const expirationCell = cells.nth(4);
-        const expirationText = await expirationCell
-          .textContent()
-          .catch(() => null);
-
-        if (!expirationText) continue;
-
-        const expirationDate = parseExpirationDate(expirationText);
-        if (!expirationDate) continue;
-
-        // 判断是否过期
-        if (expirationDate < today) {
-          // 获取 Token 描述用于日志
-          const descriptionCell = cells.nth(1);
-          const description = await descriptionCell
-            .textContent()
-            .catch(() => "Unknown");
-
-          console.log(
-            `🗑️  发现过期 Token: ${
-              description?.trim() || "Unknown"
-            } (过期时间: ${expirationText.trim()})`
-          );
-
-          try {
-            // 悬浮到该行，触发 Revoke 按钮显示
-            await row.hover();
-            await page.waitForTimeout(500);
-
-            // 点击 Revoke 按钮（class 为 action-remove）
-            const revokeButton = row.locator(".action-remove").first();
-            if (!(await revokeButton.isVisible({ timeout: 3000 }))) {
-              console.log("   ⚠️  未找到 Revoke 按钮，跳过");
-              failedCount++;
-              continue;
-            }
-
-            await revokeButton.click();
-            await page.waitForTimeout(1000);
-
-            // 点击确认弹窗中的 Revoke 按钮（id 为 action-confirm）
-            const confirmButton = page.locator("#action-confirm");
-            if (!(await confirmButton.isVisible({ timeout: 5000 }))) {
-              console.log("   ⚠️  未找到确认按钮，跳过");
-              failedCount++;
-              continue;
-            }
-
-            await confirmButton.click();
-            await page.waitForTimeout(2000);
-
-            console.log(`   ✅ 已删除: ${description?.trim() || "Unknown"}`);
-            cleanedCount++;
-            foundExpired = true;
-
-            // 删除成功后跳出内层循环，重新获取行列表
-            break;
-          } catch (error) {
-            console.log(
-              `   ❌ 删除失败: ${
-                error instanceof Error ? error.message : error
-              }`
-            );
-            failedCount++;
-            continue;
-          }
-        }
-      }
-
-      // 如果这一轮没有找到过期的 Token，退出循环
-      if (!foundExpired) {
-        break;
-      }
-    }
-
-    if (cleanedCount > 0 || failedCount > 0) {
-      console.log(
-        `\n🧹 清理完成: 成功删除 ${cleanedCount} 个过期 Token${
-          failedCount > 0 ? `，${failedCount} 个删除失败` : ""
-        }`
-      );
-    } else {
-      console.log("✅ 没有发现过期的 Token");
-    }
-  } catch (error) {
-    console.error(
-      "⚠️  清理过期 Token 时出错:",
-      error instanceof Error ? error.message : error
-    );
-    // 清理失败不影响主流程
-  }
-}
-
-/**
- * 从 Token 列表中获取最新的 Token
- * 1. 先点击 CREATION 表头，按创建时间升序排序
- * 2. 然后获取最后一行的 Token（最新的）
- */
-async function getLatestTokenFromList(page: Page): Promise<string | null> {
-  try {
-    // 点击 CREATION 表头，按创建时间升序排序（最新的在最后一行）
-    console.log("🔄 按创建时间排序 Token 列表...");
-    const creationHeader = page.locator('span.sortable[data-id="creation"]');
-    if (await creationHeader.isVisible({ timeout: 5000 })) {
-      await creationHeader.click();
-      await page.waitForTimeout(1500);
-      console.log("✅ 已按创建时间排序");
-    } else {
-      console.log("⚠️ 未找到 CREATION 表头，继续使用默认排序");
-    }
-
-    // 获取 Token 列表
-    const tokenElements = page.locator(".limit-name");
-    const count = await tokenElements.count();
-
-    if (count === 0) {
-      console.log("⚠️ 未找到 Token 列表");
-      return null;
-    }
-
-    console.log(`📋 找到 ${count} 个 Token，获取最新的...`);
-
-    // 获取最后一个（最新添加的）Token
-    const lastToken = tokenElements.nth(count - 1);
-    const tokenText = await lastToken.textContent();
-
-    if (!tokenText || tokenText.trim().length === 0) {
-      console.log("⚠️ Token 值为空");
-      return null;
-    }
-
-    return tokenText.trim();
-  } catch (error) {
-    console.error(
-      "❌ 获取 Token 列表出错:",
-      error instanceof Error ? error.message : error
-    );
-    return null;
-  }
-}
-
-/**
- * 生成 Token 描述（格式：auto-refresh-YYYY-MM-DD-HH-mm-ss）
- */
-function generateTokenDescription(): string {
-  const now = new Date();
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  return `auto-refresh-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(
-    now.getDate()
-  )}-${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-}
-
-/**
- * 创建新 Token
- */
-async function createNewToken(page: Page): Promise<string | null> {
-  try {
-    console.log("🔍 正在查找添加 Token 按钮...");
-
-    // 点击添加按钮（带有特定颜色的 SVG 图标）
-    const addButton = page.locator('svg[color="#0070c9"]').first();
-    if (!(await addButton.isVisible({ timeout: 10000 }))) {
-      console.error("❌ 未找到添加 Token 按钮");
-      console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-      await waitForUserExit();
-      return null;
-    }
-
-    console.log("🔘 点击添加 Token 按钮...");
-    await addButton.click();
-    await page.waitForTimeout(2000);
-
-    // 等待弹窗出现
-    console.log("⏳ 等待弹窗加载...");
-
-    // 选择 Token Type: Server API
-    console.log("📝 选择 Token Type: Server API...");
-    const serverAPIRadio = page.locator(
-      'input[name="tokenType"][value="serverAPI"]'
-    );
-    if (!(await serverAPIRadio.isVisible({ timeout: 5000 }))) {
-      console.error("❌ 未找到 Token Type 选择框");
-      console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-      await waitForUserExit();
-      return null;
-    }
-    await serverAPIRadio.click();
-    await page.waitForTimeout(500);
-
-    // 选择 Restriction Type: None
-    console.log("📝 选择 Restriction Type: None...");
-    const noneRestrictionRadio = page.locator(
-      'input[name="tokenEnvironment"][value="test"]'
-    );
-    if (!(await noneRestrictionRadio.isVisible({ timeout: 5000 }))) {
-      console.error("❌ 未找到 Restriction Type 选择框");
-      console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-      await waitForUserExit();
-      return null;
-    }
-    await noneRestrictionRadio.click();
-    await page.waitForTimeout(500);
-
-    // 填写 Token Description
-    const description = generateTokenDescription();
-    console.log(`📝 填写 Token Description: ${description}...`);
-    const descriptionInput = page.locator('input[placeholder*="Description"]');
-    if (!(await descriptionInput.isVisible({ timeout: 5000 }))) {
-      console.error("❌ 未找到 Description 输入框");
-      console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-      await waitForUserExit();
-      return null;
-    }
-    await descriptionInput.fill(description);
-    await page.waitForTimeout(500);
-
-    // 点击 Create 按钮
-    console.log("🔘 点击 Create 按钮...");
-    const createButton = page.locator('button:has-text("Create")');
-    if (!(await createButton.isVisible({ timeout: 5000 }))) {
-      console.error("❌ 未找到 Create 按钮");
-      console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-      await waitForUserExit();
-      return null;
-    }
-    await createButton.click();
-
-    // 等待创建完成，页面刷新
-    console.log("⏳ 等待 Token 创建完成...");
-    await page.waitForTimeout(5000);
-    await page
-      .waitForLoadState("networkidle", { timeout: 30000 })
-      .catch(() => {});
-
-    // 从列表中获取最新的 Token
-    console.log("🔍 正在获取新创建的 Token...");
-    const token = await getLatestTokenFromList(page);
-
-    if (!token) {
-      console.error("❌ 未能获取新创建的 Token");
-      console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-      await waitForUserExit();
-      return null;
-    }
-
-    return token;
-  } catch (error) {
-    console.error(
-      "❌ 创建 Token 出错:",
-      error instanceof Error ? error.message : error
-    );
-    console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-    await waitForUserExit();
-    return null;
-  }
-}
-
-/**
- * 等待用户手动退出
- */
-async function waitForUserExit(): Promise<void> {
-  await new Promise(() => {
-    // 保持程序运行，等待用户 Ctrl+C
-  });
-}
-
-/**
- * 登录并刷新（创建新）MapKit Token
- * @param username Apple ID 用户名
- * @param password Apple ID 密码
- * @param headless 是否使用无头模式
- * @param useAuthCache 是否使用登录状态缓存
- * @param verificationCodeProvider 可选的验证码提供者函数（Server 模式使用）
- */
-export async function refreshMapKitToken(
-  username: string,
-  password: string,
-  headless: boolean = false,
-  useAuthCache: boolean = true,
-  verificationCodeProvider?: VerificationCodeProvider
-): Promise<string | null> {
-  console.log("🚀 正在启动浏览器...");
-
-  // 检查是否存在登录状态文件
-  const hasAuthState = existsSync(AUTH_STATE_FILE) && useAuthCache;
-
-  const browser = await chromium.launch({
-    headless,
-    args: ["--window-size=1280,800"],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    locale: "zh-CN",
-    ...(hasAuthState ? { storageState: AUTH_STATE_FILE } : {}),
-  });
-
-  if (hasAuthState) {
-    console.log("🔄 已加载缓存的登录状态");
-  }
-
-  const page = await context.newPage();
-
-  try {
-    // 跳转到目标页面
-    console.log(`📍 正在跳转到: ${APPLE_DEVELOPER_URL}`);
-    await page.goto(APPLE_DEVELOPER_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
+async function operation(
+  mode: 'get' | 'refresh', username: string, password: string, headless: boolean,
+  useAuthCache: boolean, provider: VerificationCodeProvider | undefined, options: BrowserOptions,
+): Promise<BrowserResult> {
+  return withBrowser(headless, async (browser, signal, setPage) => {
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 800 }, locale: 'zh-CN', timezoneId: 'Asia/Shanghai',
+      ...(useAuthCache && existsSync(AUTH_STATE_FILE) ? { storageState: AUTH_STATE_FILE } : {}),
     });
-    await page.waitForTimeout(3000);
-
-    const currentUrl = page.url();
-    console.log(`📍 当前页面: ${currentUrl}`);
-
-    // 检测是否需要登录
-    if (isLoginPage(currentUrl)) {
-      console.log("🔐 检测到登录页面，正在登录...");
-
-      const loginSuccess = await performLogin(
-        page,
-        username,
-        password,
-        verificationCodeProvider
-      );
-      if (!loginSuccess) {
-        console.error("❌ 登录失败");
-        console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-        await waitForUserExit();
-        return null;
+    context.setDefaultTimeout(ACTION_TIMEOUT_MS);
+    context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+    signal.throwIfAborted();
+    const page = await context.newPage();
+    setPage(page);
+    try {
+      await page.goto(APPLE_DEVELOPER_URL, { waitUntil: 'domcontentloaded' });
+      await assertNoAccessBlock(page);
+      // Wait for either the redirect to the login provider or a recognizable token page.
+      const deadline = Date.now() + ACTION_TIMEOUT_MS;
+      while (!isLoginPage(page.url())) {
+        try { await waitForTokenList(page, 500); break; }
+        catch (error) { if (!(error instanceof OperationError) || error.code !== 'TOKEN_LIST_UNRECOGNIZED') throw error; }
+        if (Date.now() >= deadline) throw new OperationError('TOKEN_LIST_UNRECOGNIZED', '未能进入登录页面或识别 Token 列表');
       }
-
-      console.log("✅ 登录成功");
-
-      // 保存登录状态
-      console.log("💾 保存登录状态...");
+      if (isLoginPage(page.url())) await performLogin(page, username, password, signal, provider);
+      await assertNoAccessBlock(page);
+      if (!page.url().includes('/maps-tokens')) await page.goto(APPLE_DEVELOPER_URL, { waitUntil: 'domcontentloaded' });
+      await assertNoAccessBlock(page);
+      // Authentication succeeded even if a later portal layout change interrupts the task.
+      await mkdir(path.dirname(AUTH_STATE_FILE), { recursive: true });
       await context.storageState({ path: AUTH_STATE_FILE });
-      console.log("✅ 登录状态已保存");
-
-      await page.waitForTimeout(3000);
+      await waitForTokenList(page);
+      const result = await cleanupExpiredTokens(page, { signal });
+      if (!result.cleanup.complete) await within(saveDiagnostics(page, new OperationError('CLEANUP_INCOMPLETE', '过期 Token 清理未全部完成')), 5_000, new Error('诊断超时')).catch(() => {});
+      signal.throwIfAborted();
+      // Restore the list after a failed confirmation dialog before continuing.
+      if (!result.cleanup.complete) {
+        await page.goto(APPLE_DEVELOPER_URL, { waitUntil: 'domcontentloaded' });
+        await waitForTokenList(page);
+      }
+      const token = mode === 'refresh' ? await createNewToken(page) : await findToken(page);
+      signal.throwIfAborted();
+      await mkdir(path.dirname(AUTH_STATE_FILE), { recursive: true });
+      await context.storageState({ path: AUTH_STATE_FILE });
+      return { token, ...result };
+    } catch (error) {
+      signal.throwIfAborted();
+      await assertNoAccessBlock(page);
+      throw asOperationError(error);
     }
+  }, { ...options, onFailure: options.onFailure ?? saveDiagnostics });
+}
 
-    // 确保在 Token 页面
-    const afterLoginUrl = page.url();
-    if (!afterLoginUrl.includes("maps-tokens")) {
-      console.log("📍 正在跳转到 Token 管理页面...");
-      await page.goto(APPLE_DEVELOPER_URL, {
-        waitUntil: "networkidle",
-        timeout: 60000,
-      });
-    }
+export function refreshMapKitToken(
+  username: string, password: string, headless = false, useAuthCache = true,
+  provider?: VerificationCodeProvider, options: BrowserOptions = {},
+): Promise<BrowserResult> {
+  return operation('refresh', username, password, headless, useAuthCache, provider, options);
+}
 
-    // 等待页面加载
-    console.log("⏳ 等待页面加载...");
-    await page.waitForTimeout(5000);
+export function getMapKitToken(
+  username: string, password: string, headless = false, useAuthCache = true, options: BrowserOptions = {},
+): Promise<BrowserResult> {
+  return operation('get', username, password, headless, useAuthCache, undefined, options);
+}
 
-    // 创建新 Token
-    console.log("🆕 正在创建新 Token...");
-    const token = await createNewToken(page);
-
-    if (token) {
-      console.log("\n═══════════════════════════════════════");
-      console.log("✅ Token 创建成功！");
-      console.log("═══════════════════════════════════════\n");
-      console.log(token);
-      console.log("");
-
-      // 清理过期的 Token
-      await cleanupExpiredTokens(page);
-    }
-
-    // 保存最新的登录状态
-    console.log("💾 保存登录状态...");
-    await context.storageState({ path: AUTH_STATE_FILE });
-
-    await browser.close();
-    return token;
-  } catch (error) {
-    console.error(
-      "❌ 发生错误:",
-      error instanceof Error ? error.message : error
-    );
-    console.log("💡 请手动操作，完成后按 Ctrl+C 退出");
-    await waitForUserExit();
-    return null;
-  }
+export async function openAppleDeveloperPortal(headless = false): Promise<void> {
+  await withBrowser(headless, async (browser: Browser, signal, setPage) => {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+    setPage(page);
+    await page.goto(APPLE_DEVELOPER_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+    console.log('💡 浏览器已打开，关闭窗口或按 Ctrl+C 退出');
+    await abortable(new Promise<void>(resolve => browser.once('disconnected', () => resolve())), signal);
+  }, { timeoutMs: 0, onFailure: saveDiagnostics });
 }

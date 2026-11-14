@@ -19,9 +19,26 @@ export interface CLIOptions {
  * 浏览器操作结果
  */
 export interface BrowserResult {
-  success: boolean;
-  message: string;
+  token: string;
+  cleanup: CleanupSummary;
+  warnings: string[];
+}
+
+export interface CleanupSummary {
+  scanned: number;
+  expired: number;
+  revoked: number;
+  failed: number;
+  skipped: number;
+  complete: boolean;
+}
+
+export interface TaskResult {
   token?: string;
+  error?: string;
+  errorCode?: string;
+  warnings?: string[];
+  cleanup?: CleanupSummary;
 }
 
 // ========== 任务管理相关类型 ==========
@@ -47,11 +64,9 @@ export interface Task {
   status: TaskStatus;
   createdAt: Date;
   expiresAt: Date;
+  deadlineAt: Date;
   verificationCode?: string;
-  result?: {
-    token?: string;
-    error?: string;
-  };
+  result?: TaskResult;
 }
 
 /**

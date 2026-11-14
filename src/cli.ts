@@ -3,7 +3,7 @@
 import { Command } from 'commander';
 import { openAppleDeveloperPortal, getTargetUrl, getMapKitToken, refreshMapKitToken } from './browser.js';
 import { loadConfig } from './config.js';
-import { writeFileSync } from 'fs';
+import { writeTokenFile } from './results.js';
 import path from 'path';
 import { startServer } from './server.js';
 
@@ -54,15 +54,19 @@ program
       console.log('');
       
       // 执行获取
-      const token = await getMapKitToken(username, password, options.headless, options.authCache);
+      const result = await getMapKitToken(username, password, options.headless, options.authCache);
       
+      const { token, warnings, cleanup } = result;
+      console.log(token);
+      console.log(`🧹 清理：扫描 ${cleanup.scanned}，过期 ${cleanup.expired}，撤销 ${cleanup.revoked}，失败 ${cleanup.failed}，跳过 ${cleanup.skipped}`);
+      for (const warning of warnings) console.warn(`⚠️ ${warning}`);
       if (token) {
-        // Token 已在 getMapKitToken 中输出
+        // Token 和清理结果已输出
         
         // 如果指定了输出路径，则写入文件
         if (options.out) {
           const outputPath = path.resolve(options.out);
-          writeFileSync(outputPath, token, 'utf-8');
+          await writeTokenFile(outputPath, token);
           console.log(`📄 Token 已保存到: ${outputPath}`);
         }
         
@@ -99,15 +103,19 @@ program
       console.log('');
       
       // 执行刷新
-      const token = await refreshMapKitToken(username, password, options.headless, options.authCache);
+      const result = await refreshMapKitToken(username, password, options.headless, options.authCache);
       
+      const { token, warnings, cleanup } = result;
+      console.log(token);
+      console.log(`🧹 清理：扫描 ${cleanup.scanned}，过期 ${cleanup.expired}，撤销 ${cleanup.revoked}，失败 ${cleanup.failed}，跳过 ${cleanup.skipped}`);
+      for (const warning of warnings) console.warn(`⚠️ ${warning}`);
       if (token) {
-        // Token 已在 refreshMapKitToken 中输出
+        // Token 和清理结果已输出
         
         // 如果指定了输出路径，则写入文件
         if (options.out) {
           const outputPath = path.resolve(options.out);
-          writeFileSync(outputPath, token, 'utf-8');
+          await writeTokenFile(outputPath, token);
           console.log(`📄 Token 已保存到: ${outputPath}`);
         }
         

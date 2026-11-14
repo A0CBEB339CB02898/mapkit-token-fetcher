@@ -34,3 +34,6 @@ config.yaml
 
 # Docker data directory
 data/
+
+# Sanitized browser failure diagnostics
+diagnostics/

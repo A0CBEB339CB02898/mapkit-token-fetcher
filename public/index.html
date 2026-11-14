@@ -445,7 +445,14 @@
           disableInputs();
           break;
         case 'completed':
-          showMessage('success', 'Token 刷新成功！');
+          showMessage(task.result?.warnings?.length ? 'warning' : 'success',
+            task.result?.warnings?.length
+              ? `刷新成功，但清理未全部完成：${task.result.warnings.join('；')}`
+              : 'Token 刷新成功！');
+          if (task.result?.cleanup) {
+            const c = task.result.cleanup;
+            taskStatusEl.textContent += `（清理：扫描 ${c.scanned}，过期 ${c.expired}，撤销 ${c.revoked}，失败 ${c.failed}，跳过 ${c.skipped}）`;
+          }
           hideCodeSection();
           if (task.result?.token) {
             resultSectionEl.classList.remove('hidden');
@@ -464,7 +471,7 @@
           stopPolling();
           break;
         case 'timeout':
-          showMessage('warning', '验证码已超时，请重新发起任务');
+          showMessage('warning', task.result?.error || '任务已超时，请重新发起任务');
           showRetrySection();
           stopPolling();
           break;
@@ -530,9 +537,8 @@
           submitBtn.textContent = '已提交';
           submitBtn.disabled = true;  // 保持禁用，防止重复点击
           showMessage('success', '✅ 验证码提交成功，请等待企业微信通知任务结果');
-          // 禁用所有输入，但停止轮询（用户无需继续等待页面）
+          // 保持轮询，以显示最终的清理警告或失败原因。
           disableInputs();
-          stopPolling();
           // 隐藏倒计时
           timerEl.textContent = '';
         } else {

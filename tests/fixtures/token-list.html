@@ -1,0 +1,38 @@
+<!doctype html><html><body>
+<table><thead><tr><th>DESCRIPTION</th><th>EXPIRATION</th><th>TOKEN</th><th>CREATION</th><th>ACTION</th></tr></thead><tbody></tbody></table>
+<button data-page="previous">Previous</button><button data-page="next">Next</button>
+<div role="dialog" hidden><button id="action-confirm">Revoke</button><button id="cancel">Cancel</button></div>
+<script>
+window.records = [];
+window.pageSize = 2;
+window.pageIndex = 0;
+window.noDelete = false;
+window.delayButtons = 0;
+let selected;
+window.render = () => {
+  const totalPages = Math.max(1, Math.ceil(records.length / pageSize));
+  pageIndex = Math.min(pageIndex, totalPages - 1);
+  document.querySelector('tbody').replaceChildren();
+  for (const row of records.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize)) {
+    const tr = document.createElement('tr');
+    for (const key of ['description', 'expiration', 'token', 'creation']) {
+      const td = document.createElement('td'); td.textContent = row[key]; tr.append(td);
+    }
+    const action = document.createElement('td');
+    const button = document.createElement('button'); button.className = 'action-remove'; button.textContent = 'Revoke';
+    if (delayButtons) { button.hidden = true; tr.onmouseenter = () => setTimeout(() => { button.hidden = false; }, delayButtons); }
+    button.onclick = () => { selected = row; document.querySelector('[role="dialog"]').hidden = false; };
+    action.append(button); tr.append(action); document.querySelector('tbody').append(tr);
+  }
+  document.querySelector('[data-page="previous"]').disabled = pageIndex === 0;
+  document.querySelector('[data-page="next"]').disabled = pageIndex === totalPages - 1;
+};
+document.querySelector('[data-page="next"]').onclick = () => { pageIndex++; render(); };
+document.querySelector('[data-page="previous"]').onclick = () => { pageIndex--; render(); };
+document.querySelector('#action-confirm').onclick = () => {
+  if (!noDelete) records = records.filter(row => row !== selected);
+  document.querySelector('[role="dialog"]').hidden = true; render();
+};
+document.querySelector('#cancel').onclick = () => { document.querySelector('[role="dialog"]').hidden = true; };
+render();
+</script></body></html>

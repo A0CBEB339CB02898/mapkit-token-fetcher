@@ -207,7 +207,7 @@ curl -X POST http://localhost:3010/api/refresh
 
 ### 验证码超时
 
-验证码输入有 **5 分钟** 的时效。超时后任务自动取消，需要重新发起。
+验证码输入有 **5 分钟** 的时效。超时后任务标记为 `timeout` 并释放浏览器，需要重新发起。
 
 ---
 
@@ -232,3 +232,69 @@ serve 选项:
   --no-auth-cache            不使用缓存的登录状态（强制重新登录）
 ```
 
+
+
+## 自动任务的超时与资源回收
+
+`get`、`refresh` 和 Server 任务遇到错误后会退出并关闭浏览器，不再等待手动操作。需要人工浏览时使用 `open`；关闭窗口或按 Ctrl+C 退出。
+
+- 每个自动任务总时限为 15 分钟，包含最多 5 分钟的验证码等待；导航上限为 60 秒，普通元素操作上限为 15 秒。
+- 取消任务、验证码超时、任务超时或停止服务都会触发浏览器回收。取消响应表示已请求取消，实际回收期间仍保留任务占位。
+- 单个 Server 实例同时只运行一个刷新任务。运行期间重复调用 `/api/refresh` 会返回同一 `taskId`，不会再启动浏览器。重试也需要等待旧浏览器释放。
+- 浏览器关闭超过 10 秒或关闭失败时，实例停止接受刷新与重试，返回 HTTP 503 和 `BROWSER_RECOVERY_REQUIRED`。请检查诊断并重启该工具所属容器；不应通过继续重试来绕过此状态。
+- 企业微信请求最多等待 10 秒。工具不执行内部自动重试，外部调度和重试间隔保持由调用方管理。
+
+### Apple 协议或访问受限
+
+检测到账号持有人需要接受新协议时，任务以 `AGREEMENT_REQUIRED` 失败并释放浏览器；不会自动同意协议。请账号持有人登录 Apple Developer 后台处理，再重新发起任务。其他会员资源访问受限以 `ACCESS_UNAVAILABLE` 报告。
+
+页面操作失败时，在 `DATA_DIR/diagnostics` 下保存按时间区分的截图、页面 URL、frame URL 和脱敏结构；未设置 `DATA_DIR` 时使用当前目录。保留最近 20 次诊断。截图遮盖表单和 Token 单元格，结构仅保留必要的控件标签和可见错误提示，不保存输入值或脚本；包含 iframe 诊断，账号、长 Token 和六位验证码脱敏，URL 不保存查询参数。诊断失败不影响浏览器关闭。这些文件用于识别页面改版、协议弹窗和加载失败，不应公开发布。
+
+### 过期 Token 清理
+
+登录并确认列表可访问后，先尝试清理过期 Token，再获取或创建 Token。规则是清理所有来源的已过期记录，保留仍有效的记录，不限制有效 Token 的数量。
+
+- 支持按表头识别标准 HTML / ARIA 表格，或使用 `data-field` / `data-column` 明确标识字段的行，并遍历下一页。
+- 获取最新记录时优先比较创建时间；创建日期相同且没有具体时刻时，用 JWT 的 `iat` 区分。无法确认时明确报错，避免任意返回同日的旧 Token。JWT 内容仅用于排序，不作为签名或权限验证。
+- 优先读取 `time[datetime]` 等机器可读字段；文本支持 `MM/DD/YY`、`MM/DD/YYYY` 和 ISO 日期/带时区时间。不能确定到期时间的记录保留并产生警告。
+- 只有到期日期、没有具体时刻时，按 `Asia/Shanghai` 日期判断；当天到期的记录保留到次日再清理。
+- 点击撤销后必须确认记录消失才计为成功。同一失败记录不会在本次任务中反复重试；清理最多执行 2 分钟，剩余记录会在后续正常任务中再次处理。
+- 无法识别列表、分页失败或撤销失败会产生明确警告，不会显示成“没有发现过期 Token”。
+
+新 Token 获取成功且指定的输出文件写入成功后，任务才进入 `completed`。清理失败时仍交付 Token，并在网页、CLI 和企业微信通知中显示警告。输出文件使用临时文件加重命名方式更新，写入失败报告 `TOKEN_OUTPUT_FAILED`，不会报告成功。
+
+查询任务仍使用原有接口，`result.token` / `result.error` 保持兼容；新增可选的 `result.errorCode`、`result.warnings`、`result.cleanup`。清理摘要包含 `scanned`、`expired`、`revoked`、`failed`、`skipped` 和 `complete`。`deadlineAt` 表示任务总截止时间，`expiresAt` 仍用于验证码倒计时。
+
+### 升级与验证
+
+升级后重启工具所属容器，清除旧版本遗留的浏览器。人工确认协议已处理后，执行一次刷新，检查输出 Token、清理摘要、后台剩余记录及浏览器进程是否退出。页面改版导致的未知结构需要依据诊断调整定位器；不可据此假定没有过期记录。
+
+```bash
+npm run typecheck
+npm run build
+npm test
+npm run test:browser
+```
+
+测试使用本地页面和模拟通知，不访问真实苹果账号或撤销真实 Token。浏览器测试包含连续 20 次失败后的进程回收检查。需要已安装 Playwright 对应的 Chromium；也可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定可执行文件。macOS 测试在默认浏览器缺失时尝试系统 Google Chrome。容器测试仍应在部署环境执行，以检查该环境的进程和内存行为。
+
+
+需要复现容器内回归时，可使用独立测试镜像（不复制账号配置或登录状态）：
+
+```bash
+docker build -f Dockerfile.test -t mapkit-token-fetcher-test .
+docker run --rm --init --ipc=host mapkit-token-fetcher-test
+```
+
+
+### 本机真实验收（macOS）
+
+完成协议确认并在本地 `config.yaml` 填好账号后，可运行：
+
+```bash
+node --import tsx scripts/live-acceptance.ts
+```
+
+该脚本使用系统 Google Chrome，在 `127.0.0.1:3011` 提供验证码页面。它会真实清理过期 Token 并创建一个新 Token；不发送企业微信通知。登录状态、脱敏诊断和输出 Token 单独存放在被 Git 忽略的 `data/live-acceptance` 中，不覆盖原来的登录缓存或业务输出文件。请勿在同一账号有其他刷新任务运行时同时验收。
+
+`--get` 仅执行正常的获取/清理流程，不创建 Token。`scripts/inspect-live.ts` 使用验收登录状态只读检查列表；如果创建已经成功、但读取结果失败，可用 `--recover-description=<本次唯一描述>` 精确取回同一记录并写入验收输出文件，避免重复创建。两种脚本均不在控制台打印密码、Cookie 或 Token 内容。

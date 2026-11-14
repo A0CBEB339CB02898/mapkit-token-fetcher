@@ -85,7 +85,8 @@ export class WeComNotifier implements Notifier {
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(message)
+        body: JSON.stringify(message),
+        signal: AbortSignal.timeout(10_000)
       });
 
       if (!response.ok) {

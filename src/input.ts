@@ -13,13 +13,20 @@ function createReadlineInterface(): readline.Interface {
 /**
  * 提示用户输入（普通文本）
  */
-export async function prompt(question: string): Promise<string> {
+export async function prompt(question: string, signal?: AbortSignal): Promise<string> {
   const rl = createReadlineInterface();
   
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
+  return new Promise((resolve, reject) => {
+    const abort = () => { reject(signal?.reason ?? new Error('输入已取消')); rl.close(); };
+    signal?.addEventListener('abort', abort, { once: true });
+    rl.once('close', () => {
+      signal?.removeEventListener('abort', abort);
+      resolve('');
+    });
+    if (signal?.aborted) { abort(); return; }
+    rl.question(question, answer => {
       resolve(answer.trim());
+      rl.close();
     });
   });
 }
@@ -117,9 +124,9 @@ export async function getCredentials(
 /**
  * 提示用户输入验证码
  */
-export async function promptVerificationCode(): Promise<string> {
+export async function promptVerificationCode(signal?: AbortSignal): Promise<string> {
   console.log('');
   console.log('📱 检测到需要两步验证');
-  const code = await prompt('🔢 请输入验证码: ');
+  const code = await prompt('🔢 请输入验证码: ', signal);
   return code;
 }
